@@ -4,9 +4,8 @@ import io
 import os
 import re
 import unicodedata
-import hashlib
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional, Tuple, Dict, Any, List
 
 import pandas as pd
@@ -15,21 +14,12 @@ from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-from google.cloud import storage
-from google.api_core.exceptions import NotFound, PreconditionFailed
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 
 # ================== KONFIGURÁCIA ==================
 
-SOURCE_BUCKET_NAME = "objednavky-vstup-ggt"
-
-REQUIRED_PREFIX = "kontrola_prijemky/"  # očakávame: kontrola_prijemky/<station>/<job_id>/_READY.json
-READY_FILENAME = "_READY.json"
-
-# Routing podľa station folderu
 SENDER_EMAIL = "preposli@preposlimail.com"
 RECIPIENTS = {
     "703": "frantisek.bacik@gmail.com",
@@ -41,18 +31,16 @@ FALLBACK_EMAIL = "frantisek.bacik@gmail.com"
 
 # Gmail API
 GMAIL_SA_FILE = "gmail-sa-key.json"
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+BASE_GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.send",
+]
 
-# ✅ LOCKS / PROCESSED v GCS
-ENABLE_LOCKS = True
-LOCKS_BASE_PREFIX = "_locks/"  # root folder
-LOCKS_NAMESPACE = "kontrola_prijemky"
-LOCKS_PREFIX = f"{LOCKS_BASE_PREFIX}{LOCKS_NAMESPACE}/locked/"
-PROCESSED_PREFIX = f"{LOCKS_BASE_PREFIX}{LOCKS_NAMESPACE}/processed/"
-
-# Vstupné súbory v rámci job foldera (podpora xlsx aj xls)
-ORDER_FILENAMES = ["objednavka.xlsx", "objednavka.xls"]
-RECEIPT_FILENAMES = ["prijemka.xlsx", "prijemka.xls"]
+INTERNAL_LABEL_NAME = os.getenv("KONTROLA_INTERNAL_LABEL", "_kontrola_prijemky_auto")
+PROCESSED_LABEL_NAME = os.getenv("KONTROLA_PROCESSED_LABEL", "kontrola_spracovane")
+FAILED_LABEL_NAME = os.getenv("KONTROLA_FAILED_LABEL", "kontrola_failed")
+# Centralized architecture: this service is subscriber-only by default.
+KONTROLA_ENABLE_WATCH_RENEW = os.getenv("KONTROLA_ENABLE_WATCH_RENEW", "0") == "1"
 
 # Excluded IDs (podľa tvojich pravidiel)
 EXCLUDED_IDS = {"506875", "506874", "503179"}
@@ -65,142 +53,186 @@ SHEET_ORDERED_NOT_RECEIVED = "OBJEDNANE_NEPRISLO"
 SHEET_NOT_ORDERED = "NEOBJEDNANE_PRISLO"
 SHEET_ORDERED_AND_RECEIVED = "OBJEDNANE_AJ_PRISLO"
 
+ATTACHMENT_EXTENSIONS = (".xls", ".xlsx")
 
-# ================== EVENT PARSE ==================
+STATION_SUBJECT_RE = re.compile(r"([0-9]{3})")
 
-def parse_event(request) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """
-    Podporí viac formátov:
-    - priamy JSON s {name,bucket,generation}
-    - {data:{...}}
-    - PubSub push: {message:{data:<base64 JSON>}}
-    """
+
+# ================== AUTH ==================
+
+def get_gmail_service():
+    key_path = os.path.join(os.path.dirname(__file__), GMAIL_SA_FILE)
+    creds = service_account.Credentials.from_service_account_file(
+        key_path,
+        scopes=BASE_GMAIL_SCOPES,
+        subject=SENDER_EMAIL,
+    )
+    return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+# ================== GMAIL HELPERS ==================
+
+def decode_b64url(data: str) -> bytes:
+    padded = data + ("=" * (-len(data) % 4))
+    return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+
+def parse_pubsub_notification(request):
     event = request.get_json(silent=True)
-    full_path = None
-    bucket_name = None
-    generation = None
-
     if not isinstance(event, dict):
-        return None, None, None
+        return None, None
 
-    if "name" in event and "bucket" in event:
-        full_path = event.get("name")
-        bucket_name = event.get("bucket")
-        generation = event.get("generation")
+    message = event.get("message", {})
+    if not isinstance(message, dict):
+        return None, None
 
-    elif "data" in event and isinstance(event["data"], dict):
-        data = event["data"]
-        full_path = data.get("name")
-        bucket_name = data.get("bucket")
-        generation = data.get("generation")
+    data_b64 = message.get("data")
+    if not data_b64:
+        return None, None
 
-    elif "message" in event:
-        msg = event.get("message", {})
-        data_b64 = msg.get("data")
-        if data_b64:
-            try:
-                decoded = base64.b64decode(data_b64).decode("utf-8")
-                data_json = json.loads(decoded)
-                full_path = data_json.get("name")
-                bucket_name = data_json.get("bucket")
-                generation = data_json.get("generation")
-            except Exception as e:
-                print("❌ PubSub decode failed:", repr(e))
-
-    return full_path, bucket_name, generation
-
-
-# ================== PATH HELPERS ==================
-
-def is_ready_marker(full_path: str) -> bool:
-    return bool(full_path) and full_path.endswith("/" + READY_FILENAME)
-
-def extract_station_and_job(full_path: str) -> Tuple[str, str]:
-    """
-    Očakávame:
-      kontrola_prijemky/<station>/<job_id>/_READY.json
-    """
-    if not full_path or not full_path.startswith(REQUIRED_PREFIX):
-        return "", ""
-
-    rest = full_path[len(REQUIRED_PREFIX):]  # "<station>/<job_id>/_READY.json"
-    parts = rest.split("/")
-    if len(parts) < 3:
-        return "", ""
-
-    station = (parts[0] or "").strip()
-    job_id = (parts[1] or "").strip()
-    return station, job_id
-
-def build_job_prefix(station: str, job_id: str) -> str:
-    return f"{REQUIRED_PREFIX}{station}/{job_id}/"
-
-def build_input_paths(station: str, job_id: str) -> Tuple[List[str], List[str]]:
-    prefix = build_job_prefix(station, job_id)
-    order_paths = [prefix + fn for fn in ORDER_FILENAMES]
-    receipt_paths = [prefix + fn for fn in RECEIPT_FILENAMES]
-    return order_paths, receipt_paths
-
-
-# ================== LOCKS (GCS) ==================
-
-def _safe_key_for_job(bucket_name: str, station: str, job_id: str) -> str:
-    raw = f"{bucket_name}::kontrola_prijemky::{station}::{job_id}".encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-def _lock_blob_name(bucket_name: str, station: str, job_id: str) -> str:
-    return f"{LOCKS_PREFIX}{_safe_key_for_job(bucket_name, station, job_id)}.lock"
-
-def _done_blob_name(bucket_name: str, station: str, job_id: str) -> str:
-    return f"{PROCESSED_PREFIX}{_safe_key_for_job(bucket_name, station, job_id)}.done"
-
-def already_done(storage_client: storage.Client, bucket_name: str, station: str, job_id: str) -> bool:
-    b = storage_client.bucket(bucket_name)
-    return b.blob(_done_blob_name(bucket_name, station, job_id)).exists()
-
-def create_lock_or_skip(storage_client: storage.Client, bucket_name: str, station: str, job_id: str) -> bool:
-    b = storage_client.bucket(bucket_name)
-    blob = b.blob(_lock_blob_name(bucket_name, station, job_id))
     try:
-        blob.upload_from_string(
-            f"locked {datetime.now(timezone.utc).isoformat()} path=kontrola_prijemky/{station}/{job_id}",
-            content_type="text/plain",
-            if_generation_match=0,  # create only if not exists
-        )
-        return True
-    except PreconditionFailed:
-        return False
-
-def mark_done(storage_client: storage.Client, bucket_name: str, station: str, job_id: str):
-    b = storage_client.bucket(bucket_name)
-    blob = b.blob(_done_blob_name(bucket_name, station, job_id))
-    try:
-        blob.upload_from_string(
-            f"done {datetime.now(timezone.utc).isoformat()} path=kontrola_prijemky/{station}/{job_id}",
-            content_type="text/plain",
-            if_generation_match=0,
-        )
-    except PreconditionFailed:
+        decoded = decode_b64url(data_b64).decode("utf-8")
+        payload = json.loads(decoded)
+        email_address = payload.get("emailAddress")
+        history_id = payload.get("historyId")
+        if email_address and history_id:
+            return email_address, str(history_id)
+    except Exception:
         pass
 
-def release_lock(storage_client: storage.Client, bucket_name: str, station: str, job_id: str):
-    b = storage_client.bucket(bucket_name)
-    blob = b.blob(_lock_blob_name(bucket_name, station, job_id))
-    try:
-        blob.delete()
-        print("LOCK_RELEASED", station, job_id)
-    except Exception as e:
-        print("LOCK_RELEASE_FAIL", type(e).__name__, str(e))
+    return None, None
 
-def delete_lock_if_exists(storage_client: storage.Client, bucket_name: str, station: str, job_id: str):
-    b = storage_client.bucket(bucket_name)
-    blob = b.blob(_lock_blob_name(bucket_name, station, job_id))
-    try:
-        if blob.exists():
-            blob.delete()
-            print("LOCK_DELETED", station, job_id)
-    except Exception as e:
-        print("LOCK_DELETE_FAIL", type(e).__name__, str(e))
+
+def build_candidate_query() -> str:
+    return (
+        f"label:{INTERNAL_LABEL_NAME} "
+        f"-label:{PROCESSED_LABEL_NAME} "
+        f"-label:{FAILED_LABEL_NAME} "
+        f"has:attachment -from:{SENDER_EMAIL} "
+        f"is:unread"
+    )
+
+
+def list_candidate_message_ids(service):
+    query = build_candidate_query()
+    ids = []
+    page_token = None
+
+    while True:
+        resp = service.users().messages().list(
+            userId="me",
+            q=query,
+            maxResults=50,
+            pageToken=page_token,
+        ).execute()
+        ids.extend([m["id"] for m in resp.get("messages", []) if m.get("id")])
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+
+    return ids
+
+
+def get_label_id(service, label_name: str) -> str:
+    labels = service.users().labels().list(userId="me").execute().get("labels", [])
+    for label in labels:
+        if label.get("name") == label_name:
+            return label["id"]
+    raise RuntimeError(f"Štítok '{label_name}' nebol nájdený.")
+
+
+def iter_parts(payload):
+    stack = [payload]
+    while stack:
+        part = stack.pop()
+        yield part
+        for child in part.get("parts", []) or []:
+            stack.append(child)
+
+
+def extract_excel_attachments(service, message):
+    message_id = message["id"]
+    payload = message.get("payload", {})
+    result = []
+
+    for part in iter_parts(payload):
+        filename = (part.get("filename") or "").strip()
+        if not filename.lower().endswith(ATTACHMENT_EXTENSIONS):
+            continue
+
+        body = part.get("body", {}) or {}
+        data = body.get("data")
+        attachment_id = body.get("attachmentId")
+
+        if data:
+            file_bytes = decode_b64url(data)
+        elif attachment_id:
+            att = service.users().messages().attachments().get(
+                userId="me",
+                messageId=message_id,
+                id=attachment_id,
+            ).execute()
+            if not att.get("data"):
+                continue
+            file_bytes = decode_b64url(att["data"])
+        else:
+            continue
+
+        result.append((filename, file_bytes))
+
+    return result
+
+
+def get_header(payload, name: str) -> str:
+    headers = payload.get("headers", []) or []
+    target = name.lower()
+    for hdr in headers:
+        if (hdr.get("name") or "").lower() == target:
+            return hdr.get("value", "")
+    return ""
+
+
+def extract_station_from_subject(subject: str) -> str:
+    if not subject:
+        return ""
+    match = STATION_SUBJECT_RE.search(subject)
+    if not match:
+        return ""
+    return match.group(1)
+
+
+def mark_message_processed(service, message_id: str, processed_label_id: str, internal_label_id: str):
+    service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"addLabelIds": [processed_label_id], "removeLabelIds": ["UNREAD", internal_label_id]},
+    ).execute()
+
+
+def mark_message_failed(service, message_id: str, failed_label_id: str, internal_label_id: str):
+    service.users().messages().modify(
+        userId="me",
+        id=message_id,
+        body={"addLabelIds": [failed_label_id], "removeLabelIds": [internal_label_id]},
+    ).execute()
+
+
+def send_email_via_gmail_api(service, recipient: str, subject: str, body_text: str, attachment_name: str, attachment_bytes: bytes):
+    msg = MIMEMultipart()
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = recipient
+    msg["Subject"] = subject
+
+    msg.attach(MIMEText(body_text, "plain"))
+
+    part = MIMEApplication(attachment_bytes, _subtype="xlsx")
+    part.add_header("Content-Disposition", "attachment", filename=attachment_name)
+    msg.attach(part)
+
+    raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+    service.users().messages().send(userId="me", body={"raw": raw_message}).execute()
+    print(f"✅ Email odoslaný na: {recipient}")
 
 
 # ================== TEXT / NORMALIZE HELPERS ==================
@@ -212,22 +244,24 @@ def strip_diacritics(s: str) -> str:
     s = unicodedata.normalize("NFKD", s)
     return "".join(ch for ch in s if not unicodedata.combining(ch))
 
+
 def norm_key(s: str) -> str:
     return strip_diacritics(str(s)).lower().strip()
 
+
 def extract_first_int_as_str(value: Any) -> str:
-    """Vráti pôvodné množstvo ako string (kvôli 'ks' atď.)."""
     if value is None:
         return "0"
     return str(value).strip()
 
+
 def extract_first_int(value: Any) -> int:
-    """Zoberie prvé celé číslo z textu (napr. '10 ks' -> 10). Ak nič, tak 0."""
     if value is None:
         return 0
     s = str(value)
     m = re.search(r"(\d+)", s)
     return int(m.group(1)) if m else 0
+
 
 def valid_id(id_value: Any) -> str:
     if id_value is None:
@@ -235,7 +269,7 @@ def valid_id(id_value: Any) -> str:
     return str(id_value).strip()
 
 
-# ================== DOWNLOAD HELPERS ==================
+# ================== EXCEL LOAD & PROCESS ==================
 
 def _engine_for_path(path: str) -> Optional[str]:
     p = (path or "").lower()
@@ -243,30 +277,11 @@ def _engine_for_path(path: str) -> Optional[str]:
         return "openpyxl"
     if p.endswith(".xls"):
         return "xlrd"
-    return None  # nechá pandas auto
-
-def download_first_existing(bucket, candidate_paths: List[str]) -> Tuple[bytes, str]:
-    """
-    Skúsi stiahnuť prvý existujúci súbor z candidate_paths.
-    Vráti (bytes, used_path).
-    """
-    last_err = None
-    for p in candidate_paths:
-        try:
-            data = bucket.blob(p).download_as_bytes()
-            return data, p
-        except NotFound as e:
-            last_err = e
-    raise last_err or NotFound(f"No matching input file found in: {candidate_paths}")
+    return None
 
 
-# ================== EXCEL LOAD & PROCESS ==================
-
-def load_order_excel(file_bytes: bytes, engine: Optional[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Objednávka: ID (A=0) | Názov (B=1) | Množstvo (C=2)
-    Preskočí hlavičku (prvý riadok).
-    """
+def load_order_excel(file_bytes: bytes, filename: str) -> Dict[str, Dict[str, Any]]:
+    engine = _engine_for_path(filename)
     df = pd.read_excel(
         io.BytesIO(file_bytes),
         header=None,
@@ -298,11 +313,9 @@ def load_order_excel(file_bytes: bytes, engine: Optional[str]) -> Dict[str, Dict
         }
     return out
 
-def load_receipt_excel(file_bytes: bytes, engine: Optional[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Príjemka: ID (A=0) | Názov (B=1) | Množstvo (D=3)
-    Preskočí hlavičku (prvý riadok).
-    """
+
+def load_receipt_excel(file_bytes: bytes, filename: str) -> Dict[str, Dict[str, Any]]:
+    engine = _engine_for_path(filename)
     df = pd.read_excel(
         io.BytesIO(file_bytes),
         header=None,
@@ -339,17 +352,10 @@ def compare(order_data: Dict[str, Dict[str, Any]],
             receipt_data: Dict[str, Dict[str, Any]]) -> Tuple[List[Dict[str, Any]],
                                                               List[Dict[str, Any]],
                                                               List[Dict[str, Any]]]:
-    """
-    Vráti 3 zoznamy:
-    1) objednané a neprišlo
-    2) neobjednané a prišlo
-    3) objednané aj prišlo
-    """
     ordered_not_received: List[Dict[str, Any]] = []
     not_ordered: List[Dict[str, Any]] = []
     ordered_and_received: List[Dict[str, Any]] = []
 
-    # 1) objednané ale neprišlo
     for id_, o in order_data.items():
         if id_ not in receipt_data:
             ordered_not_received.append({
@@ -359,7 +365,6 @@ def compare(order_data: Dict[str, Dict[str, Any]],
                 "Množstvo z príjemky": "",
             })
 
-    # 2) neobjednané ale prišlo
     for id_, r in receipt_data.items():
         if id_ not in order_data:
             not_ordered.append({
@@ -369,7 +374,6 @@ def compare(order_data: Dict[str, Dict[str, Any]],
                 "Množstvo z príjemky": r.get("qty_raw", ""),
             })
 
-    # 3) objednané aj prišlo
     for id_, o in order_data.items():
         if id_ in receipt_data:
             r = receipt_data[id_]
@@ -381,7 +385,6 @@ def compare(order_data: Dict[str, Dict[str, Any]],
                 "Množstvo z príjemky": r.get("qty_raw", ""),
             })
 
-    # triedenie podľa názvu (bez diakritiky, case-insensitive)
     def sort_key(item: Dict[str, Any]) -> str:
         return norm_key(item.get("Názov", ""))
 
@@ -395,9 +398,6 @@ def compare(order_data: Dict[str, Dict[str, Any]],
 def build_report_xlsx(ordered_not_received: List[Dict[str, Any]],
                       not_ordered: List[Dict[str, Any]],
                       ordered_and_received: List[Dict[str, Any]]) -> bytes:
-    """
-    1 Excel, 3 hárky
-    """
     buf = io.BytesIO()
 
     df1 = pd.DataFrame(ordered_not_received, columns=["ID", "Názov", "Množstvo z objednávky", "Množstvo z príjemky"])
@@ -413,190 +413,191 @@ def build_report_xlsx(ordered_not_received: List[Dict[str, Any]],
     return buf.getvalue()
 
 
-# ================== GMAIL SEND ==================
-
-def send_email_via_gmail_api(recipient: str, subject: str, body_text: str, attachment_name: str, attachment_bytes: bytes):
-    msg = MIMEMultipart()
-    msg["From"] = SENDER_EMAIL
-    msg["To"] = recipient
-    msg["Subject"] = subject
-
-    msg.attach(MIMEText(body_text, "plain"))
-
-    part = MIMEApplication(attachment_bytes, _subtype="xlsx")
-    part.add_header("Content-Disposition", "attachment", filename=attachment_name)
-    msg.attach(part)
-
-    raw_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-
-    # robustná cesta k SA key (aby nepadalo na working directory)
-    key_path = os.path.join(os.path.dirname(__file__), GMAIL_SA_FILE)
-    print("GMAIL_KEY_PATH", key_path, "exists=", os.path.exists(key_path))
-
-    creds = service_account.Credentials.from_service_account_file(
-        key_path,
-        scopes=GMAIL_SCOPES,
-        subject=SENDER_EMAIL,
-    )
-    service = build("gmail", "v1", credentials=creds)
-    service.users().messages().send(userId="me", body={"raw": raw_message}).execute()
-    print(f"✅ Email odoslaný na: {recipient}")
-
-
 # ================== HLAVNÁ FUNKCIA ==================
 
-def kontrola_prijemky_gcf(request):
-    full_path, bucket_name, generation = parse_event(request)
+def process_single_message(service, message_id: str, label_ids: Dict[str, str]):
+    message = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    payload = message.get("payload", {})
+    subject = get_header(payload, "Subject")
+    station = extract_station_from_subject(subject)
 
-    if not full_path or not bucket_name:
-        print("SKIP EVENT_INVALID (missing full_path/bucket_name)")
-        return ("OK", 200)
+    if not station or station not in RECIPIENTS:
+        print(f"SKIP SUBJECT_STATION_INVALID message={message_id} subject={subject}")
+        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        return False
 
-    if bucket_name != SOURCE_BUCKET_NAME:
-        print(f"SKIP BUCKET_MISMATCH: {bucket_name} expected={SOURCE_BUCKET_NAME}")
-        return ("OK", 200)
+    attachments = extract_excel_attachments(service, message)
+    if len(attachments) < 2:
+        print(f"SKIP EXPECT_2_ATTACHMENTS message={message_id} subject={subject} length={len(attachments)}")
+        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        return False
 
-    if not full_path.startswith(REQUIRED_PREFIX):
-        print(f"SKIP PREFIX_MISMATCH: {full_path} expected_prefix={REQUIRED_PREFIX}")
-        return ("OK", 200)
-
-    # ✅ Spracujeme iba _READY.json (1 spustenie na job)
-    if not is_ready_marker(full_path):
-        print(f"SKIP NOT_READY_MARKER: {full_path}")
-        return ("OK", 200)
-
-    station, job_id = extract_station_and_job(full_path)
-    if station not in RECIPIENTS or not job_id:
-        print(f"SKIP BAD_PATH: station={station} job_id={job_id} path={full_path}")
-        return ("OK", 200)
-
-    recipient = RECIPIENTS.get(station, FALLBACK_EMAIL)
-    print(f"📦 KONTROLA_PRIJEMKY START station={station} job_id={job_id} recipient={recipient}")
-
-    storage_client = storage.Client()
-    lock_acquired = False
-
-    # ✅ LOCK / DONE (job-level)
-    if ENABLE_LOCKS:
-        try:
-            if already_done(storage_client, bucket_name, station, job_id):
-                print("SKIP ALREADY_PROCESSED:", station, job_id)
-                return ("OK", 200)
-
-            if not create_lock_or_skip(storage_client, bucket_name, station, job_id):
-                print("SKIP LOCK_EXISTS:", station, job_id)
-                return ("OK", 200)
-
-            lock_acquired = True
-
-        except Exception as e:
-            print("FAIL LOCK_FAIL:", type(e).__name__, str(e))
-            print(traceback.format_exc())
-            return ("OK", 200)
-
-    bucket = storage_client.bucket(bucket_name)
-
-    # --------- 1) download oba súbory ---------
-    order_paths, receipt_paths = build_input_paths(station, job_id)
+    # Nájdeme ktorý súbor je objednávka a ktorý príjemka podľa názvu v prilohe
+    order_file, receipt_file = None, None
+    for filename, filebytes in attachments:
+        fn_lower = strip_diacritics(filename).lower()
+        if "obj" in fn_lower:
+            order_file = (filename, filebytes)
+        elif "prijem" in fn_lower:
+            receipt_file = (filename, filebytes)
+            
+    if not order_file and not receipt_file:
+        # Fallback (prvá je objednávka, druhá je príjemka?) - ale radšej nie
+        print(f"SKIP CANNOT_IDENTIFY_FILES message={message_id}")
+        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        return False
+        
+    if not order_file:
+         # Ak nenašlo obj., ale len prijemku, zoberie druhé ako obj
+         print(f"WARING: could not find 'obj' in filename, guessing...")
+         order_file = next(a for a in attachments if a[0] != receipt_file[0])
+    if not receipt_file:
+         print(f"WARING: could not find 'prijem' in filename, guessing...")
+         receipt_file = next(a for a in attachments if a[0] != order_file[0])
 
     try:
-        order_bytes, used_order_path = download_first_existing(bucket, order_paths)
-        receipt_bytes, used_receipt_path = download_first_existing(bucket, receipt_paths)
-        print(
-            "FILES_DOWNLOADED",
-            "used_order_path=", used_order_path,
-            "used_receipt_path=", used_receipt_path,
-            "order_bytes=", len(order_bytes),
-            "receipt_bytes=", len(receipt_bytes),
-        )
-    except NotFound:
-        print("FAIL INPUT_NOT_FOUND:", order_paths, receipt_paths)
-        # 🔥 dôležité: uvoľni lock, inak sa to už nikdy nezopakuje
-        if ENABLE_LOCKS and lock_acquired:
-            release_lock(storage_client, bucket_name, station, job_id)
-        return ("OK", 200)
-    except Exception as e:
-        print("FAIL DOWNLOAD_FAIL:", type(e).__name__, str(e))
-        print(traceback.format_exc())
-        if ENABLE_LOCKS and lock_acquired:
-            release_lock(storage_client, bucket_name, station, job_id)
-        return ("OK", 200)
-
-    # --------- 2) parse Excel ---------
-    try:
-        order_engine = _engine_for_path(used_order_path)
-        receipt_engine = _engine_for_path(used_receipt_path)
-        print("EXCEL_ENGINES", "order_engine=", order_engine, "receipt_engine=", receipt_engine)
-
-        order_data = load_order_excel(order_bytes, engine=order_engine)
-        receipt_data = load_receipt_excel(receipt_bytes, engine=receipt_engine)
-        print("PARSE_OK order_items=", len(order_data), "receipt_items=", len(receipt_data))
+        order_data = load_order_excel(order_file[1], filename=order_file[0])
+        receipt_data = load_receipt_excel(receipt_file[1], filename=receipt_file[0])
     except Exception as e:
         print("FAIL EXCEL_PARSE_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        if ENABLE_LOCKS and lock_acquired:
-            release_lock(storage_client, bucket_name, station, job_id)
-        return ("ERROR", 500)
+        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        return False
 
-    # --------- 3) compare ---------
     try:
         ordered_not_received, not_ordered, ordered_and_received = compare(order_data, receipt_data)
-        print(
-            "COMPARE_OK",
-            "ordered_not_received=", len(ordered_not_received),
-            "not_ordered=", len(not_ordered),
-            "ordered_and_received=", len(ordered_and_received)
-        )
     except Exception as e:
         print("FAIL COMPARE_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        if ENABLE_LOCKS and lock_acquired:
-            release_lock(storage_client, bucket_name, station, job_id)
-        return ("ERROR", 500)
+        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        return False
 
-    # --------- 4) build report ---------
     try:
         report_bytes = build_report_xlsx(ordered_not_received, not_ordered, ordered_and_received)
-        print("REPORT_BUILT bytes=", len(report_bytes))
     except Exception as e:
         print("FAIL REPORT_BUILD_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        if ENABLE_LOCKS and lock_acquired:
-            release_lock(storage_client, bucket_name, station, job_id)
-        return ("ERROR", 500)
+        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        return False
 
-    # --------- 5) email ---------
+    recipient = RECIPIENTS.get(station, FALLBACK_EMAIL)
+    now_local = datetime.now().strftime("%d%m%y")
+    out_subject = f"Kontrola príjemky {station} - {now_local}"
+    attachment_name = f"Kontrola_prijemky_{station}_{now_local}.xlsx"
+
+    body = (
+        f"Automatizovaná kontrola príjemky\n"
+        f"Stanica: {station}\n\n"
+        f"Pôvodný e-mail: {subject}\n\n"
+        f"Objednané a neprišlo: {len(ordered_not_received)}\n"
+        f"Neobjednané a prišlo: {len(not_ordered)}\n"
+        f"Objednané aj prišlo: {len(ordered_and_received)}\n\n"
+        f"Vylúčené ID: {', '.join(sorted(EXCLUDED_IDS))}\n"
+    )
+
     try:
-        now_local = datetime.now().strftime("%d%m%y")
-        subject = f"Kontrola príjemky {station} - {now_local}"
-        attachment_name = f"Kontrola_prijemky_{station}_{now_local}.xlsx"
-
-        body = (
-            f"Automatizovaná kontrola príjemky\n"
-            f"Stanica: {station}\n"
-            f"Job: {job_id}\n\n"
-            f"Objednané a neprišlo: {len(ordered_not_received)}\n"
-            f"Neobjednané a prišlo: {len(not_ordered)}\n"
-            f"Objednané aj prišlo: {len(ordered_and_received)}\n\n"
-            f"Vylúčené ID: {', '.join(sorted(EXCLUDED_IDS))}\n"
-        )
-
-        send_email_via_gmail_api(recipient, subject, body, attachment_name, report_bytes)
-        print("EMAIL_SENT", subject)
-
+        send_email_via_gmail_api(service, recipient, out_subject, body, attachment_name, report_bytes)
     except Exception as e:
         print("FAIL EMAIL_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        # 🔥 uvoľni lock, nech sa dá retry
-        if ENABLE_LOCKS and lock_acquired:
-            release_lock(storage_client, bucket_name, station, job_id)
+        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        return False
+
+    mark_message_processed(service, message_id, label_ids["processed"], label_ids["internal"])
+    print(f"DONE {station}")
+    return True
+
+
+def kontrola_prijemky_gcf(request):
+    """
+    Hlavný entrypoint pre HTTP.
+    Rozlišuje Pub/Sub notifikácie z Gmailu a obnovovací handler.
+    """
+    path = (getattr(request, "path", None) or "").rstrip("/")
+    renew_header = (request.headers.get("X-Renew-Watch", "") if hasattr(request, "headers") else "")
+
+    if path == "/renew_watch" or renew_header == "1":
+        return renew_watch_gcf(request)
+
+    email_address, history_id = parse_pubsub_notification(request)
+    if not email_address or not history_id:
+        return ("OK", 200)
+
+    print(f"PUBSUB_OK email={email_address} historyId={history_id}")
+
+    try:
+        service = get_gmail_service()
+        label_ids = {
+            "internal": get_label_id(service, INTERNAL_LABEL_NAME),
+            "processed": get_label_id(service, PROCESSED_LABEL_NAME),
+            "failed": get_label_id(service, FAILED_LABEL_NAME),
+        }
+    except Exception as e:
+        print("FAIL GMAIL_INIT_FAIL", type(e).__name__, str(e))
         return ("ERROR", 500)
 
-    # --------- 6) done ---------
-    if ENABLE_LOCKS:
-        mark_done(storage_client, bucket_name, station, job_id)
-        # upratanie locku (nech nezavadzia)
-        delete_lock_if_exists(storage_client, bucket_name, station, job_id)
+    candidate_ids = list_candidate_message_ids(service)
+    if not candidate_ids:
+        print("NO_CANDIDATES")
+        return ("OK", 200)
 
-    print("DONE", station, job_id)
+    print("CANDIDATES_FOUND", len(candidate_ids))
+
+    ok_count = 0
+    fail_count = 0
+
+    for message_id in candidate_ids:
+        try:
+            if process_single_message(service, message_id, label_ids):
+                ok_count += 1
+            else:
+                fail_count += 1
+        except Exception as e:
+            fail_count += 1
+            print("FAIL MESSAGE_PROCESS_FAIL", message_id, type(e).__name__, str(e))
+            try:
+                mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+            except Exception:
+                pass
+
+    print(f"DONE processed_ok={ok_count} processed_failed={fail_count}")
     return ("OK", 200)
+
+
+def renew_watch_gcf(request):
+    del request
+
+    if not KONTROLA_ENABLE_WATCH_RENEW:
+        print("WATCH_RENEW_SKIPPED KONTROLA_ENABLE_WATCH_RENEW=0")
+        return (json.dumps({"ok": True, "skipped": True, "reason": "watch renew disabled for this service"}), 200, {"Content-Type": "application/json"})
+
+    topic_name = os.getenv("KONTROLA_GMAIL_WATCH_TOPIC", "").strip()
+    if not topic_name:
+        print("WATCH_RENEW_SKIPPED KONTROLA_GMAIL_WATCH_TOPIC_MISSING")
+        return (json.dumps({"ok": True, "skipped": True, "reason": "KONTROLA_GMAIL_WATCH_TOPIC is not set"}), 200, {"Content-Type": "application/json"})
+
+    label_ids_env = [
+        item.strip()
+        for item in os.getenv("KONTROLA_GMAIL_WATCH_LABEL_IDS", "INBOX").split(",")
+        if item.strip()
+    ]
+    behavior = os.getenv("KONTROLA_GMAIL_WATCH_FILTER_BEHAVIOR", "include").strip().lower()
+    if behavior not in ("include", "exclude"):
+        behavior = "include"
+
+    try:
+        service = get_gmail_service()
+        body = {"topicName": topic_name, "labelIds": label_ids_env, "labelFilterBehavior": behavior}
+
+        try:
+            response = service.users().watch(userId="me", body=body).execute()
+        except Exception:
+            body.pop("labelFilterBehavior", None)
+            body["labelFilterAction"] = behavior
+            response = service.users().watch(userId="me", body=body).execute()
+
+        print("WATCH_RENEW_OK", response)
+        return (json.dumps(response), 200, {"Content-Type": "application/json"})
+    except Exception as e:
+        print("FAIL WATCH_RENEW_FAIL", type(e).__name__, str(e))
+        return ("ERROR", 500)
