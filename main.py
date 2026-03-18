@@ -30,7 +30,7 @@ RECIPIENTS = {
 FALLBACK_EMAIL = "frantisek.bacik@gmail.com"
 
 # Gmail API
-GMAIL_SA_FILE = "gmail-sa-key.json"
+GMAIL_SA_FILE = os.getenv("GMAIL_SA_FILE", "gmail-sa-key.json")
 BASE_GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.send",
@@ -61,13 +61,40 @@ STATION_SUBJECT_RE = re.compile(r"([0-9]{3})")
 # ================== AUTH ==================
 
 def get_gmail_service():
-    key_path = os.path.join(os.path.dirname(__file__), GMAIL_SA_FILE)
+    key_path = resolve_gmail_sa_path()
     creds = service_account.Credentials.from_service_account_file(
         key_path,
         scopes=BASE_GMAIL_SCOPES,
         subject=SENDER_EMAIL,
     )
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+
+def resolve_gmail_sa_path() -> str:
+    module_dir = os.path.dirname(__file__)
+    repo_root = os.path.dirname(module_dir)
+    candidates = [
+        GMAIL_SA_FILE,
+        os.path.join(repo_root, "gmail-sa-key.json"),
+        os.path.join(module_dir, "gmail-sa-key.json"),
+        "gmail-sa-key.json",
+    ]
+
+    seen = set()
+    normalized_candidates = []
+    for candidate in candidates:
+        if not candidate:
+            continue
+        normalized = os.path.abspath(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_candidates.append(normalized)
+        if os.path.exists(normalized):
+            return normalized
+
+    searched = ", ".join(normalized_candidates)
+    raise FileNotFoundError(f"Gmail SA key not found. Searched: {searched}")
 
 
 # ================== GMAIL HELPERS ==================
