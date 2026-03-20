@@ -39,6 +39,7 @@ BASE_GMAIL_SCOPES = [
 INTERNAL_LABEL_NAME = os.getenv("KONTROLA_INTERNAL_LABEL", "_kontrola_prijemky_auto")
 PROCESSED_LABEL_NAME = os.getenv("KONTROLA_PROCESSED_LABEL", "kontrola_spracovane")
 FAILED_LABEL_NAME = os.getenv("KONTROLA_FAILED_LABEL", "kontrola_failed")
+PROCESSING_LABEL_NAME = os.getenv("KONTROLA_PROCESSING_LABEL", "_kontrola_prijemky_processing")
 # Centralized architecture: this service is subscriber-only by default.
 KONTROLA_ENABLE_WATCH_RENEW = os.getenv("KONTROLA_ENABLE_WATCH_RENEW", "0") == "1"
 
@@ -135,6 +136,7 @@ def build_candidate_query() -> str:
         f"label:{INTERNAL_LABEL_NAME} "
         f"-label:{PROCESSED_LABEL_NAME} "
         f"-label:{FAILED_LABEL_NAME} "
+        f"-label:{PROCESSING_LABEL_NAME} "
         f"has:attachment -from:{SENDER_EMAIL} "
         f"is:unread"
     )
@@ -166,6 +168,21 @@ def get_label_id(service, label_name: str) -> str:
         if label.get("name") == label_name:
             return label["id"]
     raise RuntimeError(f"Štítok '{label_name}' nebol nájdený.")
+
+
+def ensure_label_id(service, label_name: str, hidden: bool = False) -> str:
+    try:
+        return get_label_id(service, label_name)
+    except RuntimeError:
+        created = service.users().labels().create(
+            userId="me",
+            body={
+                "name": label_name,
+                "labelListVisibility": "labelHide" if hidden else "labelShow",
+                "messageListVisibility": "hide" if hidden else "show",
+            },
+        ).execute()
+        return created["id"]
 
 
 def iter_parts(payload):
@@ -228,20 +245,93 @@ def extract_station_from_subject(subject: str) -> str:
     return match.group(1)
 
 
-def mark_message_processed(service, message_id: str, processed_label_id: str, internal_label_id: str):
+def modify_message_labels(service, message_id: str, add_label_ids=None, remove_label_ids=None):
+    body = {}
+    if add_label_ids:
+        body["addLabelIds"] = add_label_ids
+    if remove_label_ids:
+        body["removeLabelIds"] = remove_label_ids
+    if not body:
+        return
+    service.users().messages().modify(userId="me", id=message_id, body=body).execute()
+
+
+def mark_message_processing(service, message_id: str, processing_label_id: str):
+    modify_message_labels(
+        service,
+        message_id,
+        add_label_ids=[processing_label_id],
+        remove_label_ids=["UNREAD"],
+    )
+
+
+def mark_message_processed(
+    service,
+    message_id: str,
+    processed_label_id: str,
+    internal_label_id: str,
+    processing_label_id: Optional[str] = None,
+):
+    remove_label_ids = ["UNREAD", internal_label_id]
+    if processing_label_id:
+        remove_label_ids.append(processing_label_id)
+
     service.users().messages().modify(
         userId="me",
         id=message_id,
-        body={"addLabelIds": [processed_label_id], "removeLabelIds": ["UNREAD", internal_label_id]},
+        body={"addLabelIds": [processed_label_id], "removeLabelIds": remove_label_ids},
     ).execute()
 
 
-def mark_message_failed(service, message_id: str, failed_label_id: str, internal_label_id: str):
+def mark_message_failed(
+    service,
+    message_id: str,
+    failed_label_id: str,
+    internal_label_id: str,
+    processing_label_id: Optional[str] = None,
+):
+    remove_label_ids = [internal_label_id]
+    if processing_label_id:
+        remove_label_ids.append(processing_label_id)
+
     service.users().messages().modify(
         userId="me",
         id=message_id,
-        body={"addLabelIds": [failed_label_id], "removeLabelIds": [internal_label_id]},
+        body={"addLabelIds": [failed_label_id], "removeLabelIds": remove_label_ids},
     ).execute()
+
+
+def clear_processing_label(service, message_id: str, processing_label_id: Optional[str]):
+    if not processing_label_id:
+        return
+    try:
+        modify_message_labels(service, message_id, remove_label_ids=[processing_label_id])
+    except Exception as e:
+        print("WARN PROCESSING_LABEL_REMOVE_FAIL", message_id, type(e).__name__, str(e))
+
+
+def claim_message_for_processing(service, message_id: str, label_ids: Dict[str, str]) -> bool:
+    meta = service.users().messages().get(userId="me", id=message_id, format="minimal").execute()
+    existing = set(meta.get("labelIds", []) or [])
+
+    if label_ids["internal"] not in existing:
+        print(f"SKIP INTERNAL_LABEL_MISSING message={message_id}")
+        return False
+    if label_ids["processed"] in existing:
+        print(f"SKIP ALREADY_PROCESSED message={message_id}")
+        return False
+    if label_ids["failed"] in existing:
+        print(f"SKIP ALREADY_FAILED message={message_id}")
+        return False
+    if label_ids["processing"] in existing:
+        print(f"SKIP ALREADY_PROCESSING message={message_id}")
+        return False
+    if "UNREAD" not in existing:
+        print(f"SKIP NO_LONGER_UNREAD message={message_id}")
+        return False
+
+    mark_message_processing(service, message_id, label_ids["processing"])
+    return True
 
 
 def send_email_via_gmail_api(service, recipient: str, subject: str, body_text: str, attachment_name: str, attachment_bytes: bytes):
@@ -443,20 +533,46 @@ def build_report_xlsx(ordered_not_received: List[Dict[str, Any]],
 # ================== HLAVNÁ FUNKCIA ==================
 
 def process_single_message(service, message_id: str, label_ids: Dict[str, str]):
+    if not claim_message_for_processing(service, message_id, label_ids):
+        return None
+
     message = service.users().messages().get(userId="me", id=message_id, format="full").execute()
+    current_label_ids = set(message.get("labelIds", []) or [])
+    if label_ids["processed"] in current_label_ids:
+        clear_processing_label(service, message_id, label_ids.get("processing"))
+        return None
+    if label_ids["failed"] in current_label_ids:
+        clear_processing_label(service, message_id, label_ids.get("processing"))
+        return None
+    if label_ids["internal"] not in current_label_ids:
+        clear_processing_label(service, message_id, label_ids.get("processing"))
+        return None
+
     payload = message.get("payload", {})
     subject = get_header(payload, "Subject")
     station = extract_station_from_subject(subject)
 
     if not station or station not in RECIPIENTS:
         print(f"SKIP SUBJECT_STATION_INVALID message={message_id} subject={subject}")
-        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        mark_message_failed(
+            service,
+            message_id,
+            label_ids["failed"],
+            label_ids["internal"],
+            processing_label_id=label_ids.get("processing"),
+        )
         return False
 
     attachments = extract_excel_attachments(service, message)
     if len(attachments) < 2:
         print(f"SKIP EXPECT_2_ATTACHMENTS message={message_id} subject={subject} length={len(attachments)}")
-        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        mark_message_failed(
+            service,
+            message_id,
+            label_ids["failed"],
+            label_ids["internal"],
+            processing_label_id=label_ids.get("processing"),
+        )
         return False
 
     # Nájdeme ktorý súbor je objednávka a ktorý príjemka podľa názvu v prilohe
@@ -488,7 +604,13 @@ def process_single_message(service, message_id: str, label_ids: Dict[str, str]):
     except Exception as e:
         print("FAIL EXCEL_PARSE_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        mark_message_failed(
+            service,
+            message_id,
+            label_ids["failed"],
+            label_ids["internal"],
+            processing_label_id=label_ids.get("processing"),
+        )
         return False
 
     try:
@@ -496,7 +618,13 @@ def process_single_message(service, message_id: str, label_ids: Dict[str, str]):
     except Exception as e:
         print("FAIL COMPARE_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        mark_message_failed(
+            service,
+            message_id,
+            label_ids["failed"],
+            label_ids["internal"],
+            processing_label_id=label_ids.get("processing"),
+        )
         return False
 
     try:
@@ -504,7 +632,13 @@ def process_single_message(service, message_id: str, label_ids: Dict[str, str]):
     except Exception as e:
         print("FAIL REPORT_BUILD_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        mark_message_failed(
+            service,
+            message_id,
+            label_ids["failed"],
+            label_ids["internal"],
+            processing_label_id=label_ids.get("processing"),
+        )
         return False
 
     recipient = RECIPIENTS.get(station, FALLBACK_EMAIL)
@@ -527,10 +661,22 @@ def process_single_message(service, message_id: str, label_ids: Dict[str, str]):
     except Exception as e:
         print("FAIL EMAIL_FAIL:", type(e).__name__, str(e))
         print(traceback.format_exc())
-        mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+        mark_message_failed(
+            service,
+            message_id,
+            label_ids["failed"],
+            label_ids["internal"],
+            processing_label_id=label_ids.get("processing"),
+        )
         return False
 
-    mark_message_processed(service, message_id, label_ids["processed"], label_ids["internal"])
+    mark_message_processed(
+        service,
+        message_id,
+        label_ids["processed"],
+        label_ids["internal"],
+        processing_label_id=label_ids.get("processing"),
+    )
     print(f"DONE {station}")
     return True
 
@@ -564,6 +710,7 @@ def kontrola_prijemky_gcf(request):
             "internal": get_label_id(service, INTERNAL_LABEL_NAME),
             "processed": get_label_id(service, PROCESSED_LABEL_NAME),
             "failed": get_label_id(service, FAILED_LABEL_NAME),
+            "processing": ensure_label_id(service, PROCESSING_LABEL_NAME, hidden=True),
         }
     except Exception as e:
         print("FAIL GMAIL_INIT_FAIL", type(e).__name__, str(e))
@@ -578,22 +725,32 @@ def kontrola_prijemky_gcf(request):
 
     ok_count = 0
     fail_count = 0
+    skip_count = 0
 
     for message_id in candidate_ids:
         try:
-            if process_single_message(service, message_id, label_ids):
+            result = process_single_message(service, message_id, label_ids)
+            if result is True:
                 ok_count += 1
-            else:
+            elif result is False:
                 fail_count += 1
+            else:
+                skip_count += 1
         except Exception as e:
             fail_count += 1
             print("FAIL MESSAGE_PROCESS_FAIL", message_id, type(e).__name__, str(e))
             try:
-                mark_message_failed(service, message_id, label_ids["failed"], label_ids["internal"])
+                mark_message_failed(
+                    service,
+                    message_id,
+                    label_ids["failed"],
+                    label_ids["internal"],
+                    processing_label_id=label_ids.get("processing"),
+                )
             except Exception:
                 pass
 
-    print(f"DONE processed_ok={ok_count} processed_failed={fail_count}")
+    print(f"DONE processed_ok={ok_count} processed_failed={fail_count} processed_skipped={skip_count}")
     return ("OK", 200)
 
 
