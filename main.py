@@ -542,8 +542,14 @@ def kontrola_prijemky_gcf(request):
     """
     path = (getattr(request, "path", None) or "").rstrip("/")
     renew_header = (request.headers.get("X-Renew-Watch", "") if hasattr(request, "headers") else "")
+    renew_arg = ((request.args.get("renew_watch") or request.args.get("action") or "") if hasattr(request, "args") else "").strip().lower()
 
-    if path == "/renew_watch" or renew_header == "1":
+    if (
+        path.endswith("/renew_watch")
+        or path.endswith("/renew")
+        or renew_header == "1"
+        or renew_arg in ("1", "true", "yes", "renew", "renew_watch")
+    ):
         return renew_watch_gcf(request)
 
     email_address, history_id = parse_pubsub_notification(request)
